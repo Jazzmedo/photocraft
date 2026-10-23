@@ -1016,10 +1016,15 @@ pub fn mono(size: f32) -> FontId {
 
 /// Apply a theme to egui's global style and publish its tokens.
 pub fn apply(ctx: &egui::Context, kind: ThemeKind) {
+    apply_tokens(ctx, Tokens::for_kind(kind));
+}
+
+/// Publish ready tokens and build egui's global style from them, so the visuals always match
+/// `Tokens::get` — also for the live overrides, which recolour a stock palette.
+fn apply_tokens(ctx: &egui::Context, t: Tokens) {
     // Keep native windows at SystemDefault so macOS continues reporting OS appearance changes,
     // including when an integration or restored egui state pinned its own theme preference.
     ctx.set_theme(egui::ThemePreference::System);
-    let t = Tokens::for_kind(kind);
     ctx.data_mut(|d| d.insert_temp(egui::Id::unique("photocraft-theme"), t));
     let mut v = if t.dark() { Visuals::dark() } else { Visuals::light() };
     v.panel_fill = t.chrome;
@@ -1472,52 +1477,90 @@ mod tests {
     }
 }
 
-/// Development feature: live design-token overrides.
+/// Live design-token overrides from a watched file.
 ///
-/// Set `PHOTOCRAFT_THEME_FILE=/path/tokens.json` in a debug build; the file is polled and applied
-/// on change, so colours, radii and sizes can be tuned without recompiling. Keys are `Tokens` field
-/// names; values are `"#rrggbb"`, `"#rrggbbaa"` or numbers. Compiled out of release builds.
-#[cfg(all(debug_assertions, not(target_arch = "wasm32")))]
+/// Release builds follow the app's config-dir `theme.json`, so desktop palette tools (matugen,
+/// pywal, base16) can recolour the app by rewriting it; the app shell hands the watcher that
+/// default through [`PhotocraftApp::follow_theme_file`](crate::PhotocraftApp::follow_theme_file).
+/// `PHOTOCRAFT_THEME_FILE` points the watcher at a different file. The file is polled and applied
+/// on change, so colours, radii and sizes can be tuned without recompiling. Keys are `Tokens`
+/// field names; values are `"#rrggbb"`, `"#rrggbbaa"` or numbers.
+#[cfg(not(target_arch = "wasm32"))]
 pub mod live {
     use super::Tokens;
     use egui::Color32;
-    use std::time::SystemTime;
+    use std::time::{Duration, SystemTime};
+
+    /// How often the file is checked while it exists (palette tools rewrite it in place).
+    const PRESENT_POLL: Duration = Duration::from_millis(400);
+    /// How often it is checked while it is missing, so a dropped-in file is noticed.
+    const ABSENT_POLL: Duration = Duration::from_secs(2);
 
     #[derive(Default)]
     pub struct LiveTokens {
         path: Option<std::path::PathBuf>,
         stamp: Option<SystemTime>,
         last_check: f64,
+        last_kind: Option<super::ThemeKind>,
     }
 
     impl LiveTokens {
         pub fn from_env() -> Self {
-            Self { path: std::env::var_os("PHOTOCRAFT_THEME_FILE").map(Into::into), ..Default::default() }
+            Self::from_env_for(|name| std::env::var_os(name))
+        }
+
+        /// `PHOTOCRAFT_THEME_FILE` opts in; the config-dir default arrives separately
+        /// through [`Self::set_default`].
+        fn from_env_for(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Self {
+            Self { path: env("PHOTOCRAFT_THEME_FILE").filter(|p| !p.is_empty()).map(Into::into), ..Default::default() }
+        }
+
+        /// Follow this file when `PHOTOCRAFT_THEME_FILE` is unset. The app shell passes the
+        /// config directory's theme.json; tests construct the watcher without one, so they never
+        /// see the developer's file.
+        pub fn set_default(&mut self, path: std::path::PathBuf) {
+            if self.path.is_none() {
+                self.path = Some(path);
+            }
         }
 
         /// Re-apply overrides if the file changed. Returns true when tokens were updated.
         pub fn poll(&mut self, ctx: &egui::Context, kind: super::ThemeKind) -> bool {
+            self.poll_at(ctx, kind, ctx.input(|i| i.time))
+        }
+
+        /// `poll` with an injectable clock, so tests can step past the throttle.
+        fn poll_at(&mut self, ctx: &egui::Context, kind: super::ThemeKind, now: f64) -> bool {
             let Some(path) = &self.path else { return false };
-            let now = ctx.input(|i| i.time);
-            if now - self.last_check < 0.4 {
-                ctx.request_repaint_after(std::time::Duration::from_millis(400));
+            // Switching the base theme re-applies the stock palette, which would drop the
+            // overrides; re-apply them at once instead of waiting for the throttle or a file change.
+            let kind_changed = self.last_kind != Some(kind);
+            if !kind_changed && now - self.last_check < 0.4 {
+                ctx.request_repaint_after(PRESENT_POLL);
                 return false;
             }
             self.last_check = now;
-            ctx.request_repaint_after(std::time::Duration::from_millis(400));
-            let Ok(meta) = std::fs::metadata(path) else { return false };
+            self.last_kind = Some(kind);
+            let Ok(meta) = std::fs::metadata(path) else {
+                ctx.request_repaint_after(ABSENT_POLL);
+                return false;
+            };
             let stamp = meta.modified().ok();
-            if stamp == self.stamp {
+            if stamp == self.stamp && !kind_changed {
+                ctx.request_repaint_after(PRESENT_POLL);
                 return false;
             }
             self.stamp = stamp;
-            let Ok(text) = std::fs::read_to_string(path) else { return false };
+            let Ok(text) = std::fs::read_to_string(path) else {
+                ctx.request_repaint_after(ABSENT_POLL);
+                return false;
+            };
+            ctx.request_repaint_after(PRESENT_POLL);
             match serde_json::from_str::<serde_json::Value>(&text) {
                 Ok(v) => {
-                    super::apply(ctx, kind);
-                    let mut t = Tokens::get(ctx);
+                    let mut t = Tokens::for_kind(kind);
                     let unknown = apply_overrides(&mut t, &v);
-                    ctx.data_mut(|d| d.insert_temp(egui::Id::unique("photocraft-theme"), t));
+                    super::apply_tokens(ctx, t);
                     if !unknown.is_empty() {
                         log::warn!("unknown token keys: {unknown:?}");
                     }
@@ -1568,6 +1611,7 @@ pub mod live {
                 card_border,
                 field,
                 field_border,
+                histogram_bg,
                 hover,
                 pressed,
                 text,
@@ -1595,6 +1639,31 @@ pub mod live {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::ffi::OsString;
+
+        fn temp_dir(name: &str) -> std::path::PathBuf {
+            let dir = std::env::temp_dir().join(format!("photocraft-live-{name}-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        fn write(path: &std::path::Path, json: &str) {
+            std::fs::write(path, json).unwrap();
+        }
+
+        fn env_map(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
+            let owned: Vec<(String, OsString)> = vars.iter().map(|(k, v)| (k.to_string(), OsString::from(*v))).collect();
+            move |name: &str| owned.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone())
+        }
+
+        /// Rewrite the file and bump its mtime deterministically: two writes in the same
+        /// clock tick would otherwise look unchanged to the mtime poll.
+        fn rewrite(path: &std::path::Path, json: &str, offset: std::time::Duration) {
+            use std::fs::FileTimes;
+            write(path, json);
+            let f = std::fs::File::options().write(true).open(path).unwrap();
+            f.set_times(FileTimes::new().set_modified(std::time::SystemTime::now() + offset)).unwrap();
+        }
 
         #[test]
         fn overrides_apply_and_report_unknown() {
@@ -1603,6 +1672,93 @@ pub mod live {
             assert_eq!(t.card, Color32::from_rgb(16, 32, 48));
             assert_eq!(t.radius, 9.0);
             assert_eq!(unknown, vec!["nope".to_string()]);
+        }
+
+        #[test]
+        fn first_poll_applies_an_existing_file() {
+            let dir = temp_dir("first");
+            let path = dir.join("theme.json");
+            write(&path, r##"{"accent": "#ff0000"}"##);
+            let ctx = egui::Context::default();
+            let mut live = LiveTokens { path: Some(path), ..Default::default() };
+            assert!(live.poll_at(&ctx, super::super::ThemeKind::Pro, 0.0));
+            assert_eq!(Tokens::get(&ctx).accent, Color32::from_rgb(255, 0, 0));
+            std::fs::remove_dir_all(dir).ok();
+        }
+
+        #[test]
+        fn a_rewritten_file_reapplies_and_an_unchanged_one_is_throttled() {
+            let dir = temp_dir("rewrite");
+            let path = dir.join("theme.json");
+            write(&path, r##"{"accent": "#ff0000"}"##);
+            let ctx = egui::Context::default();
+            let mut live = LiveTokens { path: Some(path.clone()), ..Default::default() };
+            assert!(live.poll_at(&ctx, super::super::ThemeKind::Pro, 0.0));
+            // Same stamp, inside the throttle: nothing happens.
+            assert!(!live.poll_at(&ctx, super::super::ThemeKind::Pro, 0.1));
+            // Same stamp, past the throttle: still nothing.
+            assert!(!live.poll_at(&ctx, super::super::ThemeKind::Pro, 1.0));
+            rewrite(&path, r##"{"accent": "#00ff00", "histogram_bg": "#101010"}"##, std::time::Duration::from_secs(5));
+            assert!(live.poll_at(&ctx, super::super::ThemeKind::Pro, 2.0));
+            let t = Tokens::get(&ctx);
+            assert_eq!(t.accent, Color32::from_rgb(0, 255, 0));
+            assert_eq!(t.histogram_bg, Color32::from_rgb(16, 16, 16));
+            std::fs::remove_dir_all(dir).ok();
+        }
+
+        #[test]
+        fn a_base_theme_switch_reapplies_without_a_file_change() {
+            let dir = temp_dir("switch");
+            let path = dir.join("theme.json");
+            write(&path, r##"{"accent": "#ff0000"}"##);
+            let ctx = egui::Context::default();
+            let mut live = LiveTokens { path: Some(path), ..Default::default() };
+            assert!(live.poll_at(&ctx, super::super::ThemeKind::Pro, 0.0));
+            assert!(!live.poll_at(&ctx, super::super::ThemeKind::Pro, 0.1));
+            assert!(live.poll_at(&ctx, super::super::ThemeKind::SoftDark, 0.2));
+            assert_eq!(Tokens::get(&ctx).accent, Color32::from_rgb(255, 0, 0));
+            std::fs::remove_dir_all(dir).ok();
+        }
+
+        #[test]
+        fn a_malformed_file_keeps_the_previous_tokens() {
+            let dir = temp_dir("malformed");
+            let path = dir.join("theme.json");
+            write(&path, r##"{"accent": "#ff0000"}"##);
+            let ctx = egui::Context::default();
+            let mut live = LiveTokens { path: Some(path.clone()), ..Default::default() };
+            assert!(live.poll_at(&ctx, super::super::ThemeKind::Pro, 0.0));
+            rewrite(&path, "not json at all", std::time::Duration::from_secs(5));
+            assert!(!live.poll_at(&ctx, super::super::ThemeKind::Pro, 1.0));
+            assert_eq!(Tokens::get(&ctx).accent, Color32::from_rgb(255, 0, 0));
+            std::fs::remove_dir_all(dir).ok();
+        }
+
+        #[test]
+        fn a_missing_file_is_quiet() {
+            let mut live = LiveTokens { path: Some(std::env::temp_dir().join("photocraft-live-nowhere/theme.json")), ..Default::default() };
+            let ctx = egui::Context::default();
+            assert!(!live.poll_at(&ctx, super::super::ThemeKind::Pro, 0.0));
+            assert!(!live.poll_at(&ctx, super::super::ThemeKind::Pro, 10.0));
+        }
+
+        #[test]
+        fn the_env_var_sets_the_path_and_set_default_fills_an_unset_one() {
+            let pinned = LiveTokens::from_env_for(env_map(&[("PHOTOCRAFT_THEME_FILE", "/tmp/pinned.json")]));
+            assert_eq!(pinned.path, Some(std::path::PathBuf::from("/tmp/pinned.json")));
+
+            // No env var: nothing is watched until the app shell offers the config-dir default.
+            let mut quiet = LiveTokens::from_env_for(env_map(&[]));
+            assert_eq!(quiet.path, None);
+
+            let default = std::path::PathBuf::from("/conf/photocraft/theme.json");
+            quiet.set_default(default.clone());
+            assert_eq!(quiet.path, Some(default));
+
+            // An explicit env var keeps precedence over the default.
+            let mut pinned = pinned;
+            pinned.set_default(std::path::PathBuf::from("/conf/photocraft/theme.json"));
+            assert_eq!(pinned.path, Some(std::path::PathBuf::from("/tmp/pinned.json")));
         }
     }
 }

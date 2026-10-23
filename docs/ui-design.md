@@ -25,6 +25,8 @@ Window → Theme and macOS PhotoCraft → Appearance also offer Sync with system
 
 The toolbar's foreground and background colour chips follow the `Tokens::round_chips` flag. Pro and Classic leave it off and draw Photoshop's overlapping squares with Default Colors and Switch Colors above them. Studio, Studio Light, Solarized Dark, Adwaita, Adwaita Dark, Breeze Light, Breeze Dark, Soft Dark and Soft Light (the Studio-layout themes) turn it on and draw large round chips with a curved Switch Colors arrow centred right under them, its heads touching the chips: stacked vertically in one tool column, with Default Colors at their top-right, and side by side in two tool columns, with Default Colors at the toolbar's left edge. Another non-Pro theme can opt in by setting the flag.
 
+Release builds also follow a theme file, `theme.json` in the settings directory (the same directory as `preferences.json`): keys are `Tokens` field names, values are hex colours or radii, and the file is re-read on change, so desktop palette tools (matugen, pywal, base16) recolour the app live. Its keys override the colours of whichever theme is selected — the theme still decides the dark or light chrome. `PHOTOCRAFT_THEME_FILE` points the watcher elsewhere (see [development](development.md#live-design-tokens)).
+
 ## Rules
 
 - **Colours and radii come from tokens.** Read them with `Tokens::get(ctx)`; never hard-code a colour in a widget.

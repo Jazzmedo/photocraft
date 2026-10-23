@@ -1039,7 +1039,7 @@ pub struct PhotocraftApp {
     last_frame_start_ms: f64,
     /// Background job bookkeeping: opening tabs, control replies waiting on a job.
     pub jobs: jobs_ui::JobsUi,
-    #[cfg(all(debug_assertions, not(target_arch = "wasm32")))]
+    #[cfg(not(target_arch = "wasm32"))]
     live_tokens: theme::live::LiveTokens,
 }
 
@@ -1223,7 +1223,7 @@ impl PhotocraftApp {
             min_frame_ms: None,
             last_frame_start_ms: 0.0,
             jobs: Default::default(),
-            #[cfg(all(debug_assertions, not(target_arch = "wasm32")))]
+            #[cfg(not(target_arch = "wasm32"))]
             live_tokens: theme::live::LiveTokens::from_env(),
         };
         // Saved preferences are in place before the first frame; recovery starts in upkeep.
@@ -2384,7 +2384,7 @@ impl PhotocraftApp {
         self.sync_views();
         crate::type_font_preview::follow_hover(self, ctx);
         self.check_gpu(ctx);
-        #[cfg(all(debug_assertions, not(target_arch = "wasm32")))]
+        #[cfg(not(target_arch = "wasm32"))]
         if self.live_tokens.poll(ctx, self.ui.theme) {
             self.checker = None;
         }
@@ -2969,6 +2969,14 @@ impl PhotocraftApp {
         } else {
             self.apply_theme(ctx, kind);
         }
+    }
+
+    /// Follow this file for live design-token overrides when `PHOTOCRAFT_THEME_FILE` is unset.
+    /// The app shell passes the config directory's theme.json; tests don't, so they never see
+    /// the developer's file.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn follow_theme_file(&mut self, default: std::path::PathBuf) {
+        self.live_tokens.set_default(default);
     }
 
     pub(crate) fn apply_theme(&mut self, ctx: &egui::Context, kind: theme::ThemeKind) {
