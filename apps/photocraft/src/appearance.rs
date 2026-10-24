@@ -273,6 +273,15 @@ fn kde_accent(var: &dyn Fn(&str) -> Option<String>) -> Option<egui::Color32> {
     )
 }
 
+/// pywal fallback: `color4` from `~/.cache/wal/colors.json` (the palette adapters' accent).
+#[cfg(target_os = "linux")]
+fn wal_accent(var: &dyn Fn(&str) -> Option<String>) -> Option<egui::Color32> {
+    let home = var("HOME").filter(|d| std::path::Path::new(d).is_absolute())?;
+    let path = std::path::Path::new(&home).join(".cache/wal/colors.json");
+    let json: serde_json::Value = serde_json::from_str(&crate::caption_style::read_text(&path)?).ok()?;
+    parse_accent_text(json.get("color4")?.as_str()?)
+}
+
 /// Reads the desktop accent once, then follows the portal's `accent-color` changes the same way
 /// [`service`] follows the colour scheme. There is no polling: the worker sleeps in the signal
 /// iterator and wakes the UI only when the value changes.
@@ -283,11 +292,21 @@ pub fn accent_service() -> Option<photocraft_ui_egui::AccentFn> {
             let proxy = portal_proxy();
             // Subscribe before the first read, so a change during start-up isn't lost.
             let mut signals = None;
-            let initial = portal_startup(
+            let via_portal = portal_startup(
                 || signals = proxy.as_ref().and_then(|proxy| proxy.receive_signal("SettingChanged").ok()),
-                || proxy.as_ref().and_then(portal_accent).or_else(gnome_accent).or_else(|| kde_accent(&|k| std::env::var(k).ok())),
+                || proxy.as_ref().and_then(portal_accent),
             );
+            let initial = via_portal.or_else(fallback_accent);
+            if let Some(c) = initial {
+                log::info!("desktop accent #{:02x}{:02x}{:02x}", c.r(), c.g(), c.b());
+            }
             publisher.publish(initial);
+            // The portal signals accent changes on GNOME 47+ and Plasma; where it has no answer
+            // (older portals, or accents read from files), the fallback files are polled instead,
+            // so an accent picked in the desktop's settings later still reaches the app.
+            if via_portal.is_none() {
+                publisher.clone().watch_files();
+            }
             let Some(signals) = signals else { return };
             for message in signals {
                 let Ok((namespace, key, changed)) = message.body().deserialize::<(String, String, zbus::zvariant::OwnedValue)>() else {
@@ -296,7 +315,7 @@ pub fn accent_service() -> Option<photocraft_ui_egui::AccentFn> {
                 if namespace != PORTAL_NAMESPACE || key != ACCENT_PORTAL_KEY {
                     continue;
                 }
-                publisher.publish(decode_accent_value(changed).or_else(gnome_accent).or_else(|| kde_accent(&|k| std::env::var(k).ok())));
+                publisher.publish(decode_accent_value(changed).or_else(fallback_accent));
             }
         })
     }
@@ -306,9 +325,18 @@ pub fn accent_service() -> Option<photocraft_ui_egui::AccentFn> {
     }
 }
 
+/// The accent from the desktop's settings files, when the portal has none: GNOME's named accent,
+/// KDE's `kdeglobals`, then pywal's palette. Called on the worker threads only.
+#[cfg(target_os = "linux")]
+fn fallback_accent() -> Option<egui::Color32> {
+    let env = |k: &str| std::env::var(k).ok();
+    gnome_accent().or_else(|| kde_accent(&env)).or_else(|| wal_accent(&env))
+}
+
 /// The worker's handle on the shared accent. Packed as `0x0100_0000 | rgb`, with 0 meaning
 /// "no accent", so even a pure black accent counts as present.
 #[cfg(target_os = "linux")]
+#[derive(Clone)]
 struct AccentPublisher {
     value: std::sync::Arc<std::sync::atomic::AtomicU32>,
     wake: std::sync::Arc<std::sync::OnceLock<egui::Context>>,
@@ -325,6 +353,17 @@ impl AccentPublisher {
             ctx.request_repaint();
         }
         let _ = self.ready.send(());
+    }
+
+    /// Follow the settings files the portal does not signal (`kdeglobals`, pywal), polling every
+    /// couple of seconds; `publish` only wakes the UI on a real change.
+    fn watch_files(self) {
+        let _ = std::thread::Builder::new().name("accent-files".into()).spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                self.publish(fallback_accent());
+            }
+        });
     }
 }
 
@@ -445,6 +484,20 @@ mod tests {
         let packed = 0x0100_0000 | (u32::from(black.r()) << 16) | (u32::from(black.g()) << 8) | u32::from(black.b());
         assert_eq!(super::unpack_accent(packed), Some(black));
         assert_eq!(super::unpack_accent(0x0100_0000 | 0xed_5b_00), Some(egui::Color32::from_rgb(0xed, 0x5b, 0x00)));
+    }
+
+    /// The pywal fallback reads `color4` from the cache file, through an injected home.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wal_accent_reads_color4() {
+        let home = std::env::temp_dir().join(format!("photocraft-wal-accent-{}", std::process::id()));
+        std::fs::create_dir_all(home.join(".cache/wal")).unwrap();
+        let var = |name: &str| (name == "HOME").then(|| home.to_string_lossy().into_owned());
+        std::fs::write(home.join(".cache/wal/colors.json"), r##"{"color0": "#000000", "color4": "#7aa2f7", "special": {"background": "#1a1b26"}}"##).unwrap();
+        assert_eq!(super::wal_accent(&var), Some(egui::Color32::from_rgb(0x7a, 0xa2, 0xf7)));
+        let no_home = |name: &str| (name == "HOME").then(|| "/photocraft-no-home".to_string());
+        assert_eq!(super::wal_accent(&no_home), None, "no palette, no accent");
+        std::fs::remove_dir_all(&home).ok();
     }
 
     /// #2798: a first read that misses the start-up wait still wakes the idle UI.

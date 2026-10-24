@@ -1559,6 +1559,9 @@ pub mod live {
         last_kind: Option<super::ThemeKind>,
         /// The theme.json contents as last parsed, for the accent tint to layer over.
         file: Option<serde_json::Value>,
+        /// Preferences › Interface › Accent colors is the master switch for desktop theming:
+        /// when it is off the theme file is ignored and the stock themes apply.
+        pub disabled: bool,
     }
 
     impl LiveTokens {
@@ -1595,6 +1598,17 @@ pub mod live {
         /// `poll` with an injectable clock, so tests can step past the throttle.
         fn poll_at(&mut self, ctx: &egui::Context, kind: super::ThemeKind, now: f64) -> bool {
             let Some(path) = &self.path else { return false };
+            if self.disabled {
+                // Desktop theming is switched off: the stock theme applies, as if there were no
+                // file. Re-enabled, the stamp mismatch below re-reads it at once.
+                let had_stamp = self.stamp.take().is_some();
+                let had_file = self.file.take().is_some();
+                if had_stamp || had_file {
+                    super::apply(ctx, kind);
+                }
+                ctx.request_repaint_after(ABSENT_POLL);
+                return had_stamp || had_file;
+            }
             // Switching the base theme re-applies the stock palette, which would drop the
             // overrides; re-apply them at once instead of waiting for the throttle or a file change.
             let kind_changed = self.last_kind != Some(kind);
@@ -1787,6 +1801,29 @@ pub mod live {
             assert!(live.poll_at(&ctx, super::super::ThemeKind::Pro, 0.0));
             assert!(!live.poll_at(&ctx, super::super::ThemeKind::Pro, 0.1));
             assert!(live.poll_at(&ctx, super::super::ThemeKind::SoftDark, 0.2));
+            assert_eq!(Tokens::get(&ctx).accent, Color32::from_rgb(255, 0, 0));
+            std::fs::remove_dir_all(dir).ok();
+        }
+
+        /// The Accent colors preference is the master switch for desktop theming: off applies the
+        /// stock theme (as if there were no file) and on picks the file up again at once.
+        #[test]
+        fn the_accent_preference_switches_the_theme_file_off() {
+            let dir = temp_dir("master-switch");
+            let path = dir.join("theme.json");
+            write(&path, r##"{"accent": "#ff0000"}"##);
+            let ctx = egui::Context::default();
+            let mut live = LiveTokens { path: Some(path), ..Default::default() };
+            assert!(live.poll_at(&ctx, super::super::ThemeKind::Pro, 0.0));
+            assert_eq!(Tokens::get(&ctx).accent, Color32::from_rgb(255, 0, 0));
+
+            live.disabled = true;
+            assert!(live.poll_at(&ctx, super::super::ThemeKind::Pro, 0.5));
+            assert_eq!(Tokens::get(&ctx).accent, Tokens::for_kind(super::super::ThemeKind::Pro).accent, "the stock theme applies");
+            assert!(!live.poll_at(&ctx, super::super::ThemeKind::Pro, 1.0), "the file stays ignored");
+
+            live.disabled = false;
+            assert!(live.poll_at(&ctx, super::super::ThemeKind::Pro, 1.5), "re-enabled picks the file up at once");
             assert_eq!(Tokens::get(&ctx).accent, Color32::from_rgb(255, 0, 0));
             std::fs::remove_dir_all(dir).ok();
         }

@@ -2391,10 +2391,15 @@ impl PhotocraftApp {
         crate::type_font_preview::follow_hover(self, ctx);
         self.check_gpu(ctx);
         #[cfg(not(target_arch = "wasm32"))]
-        if self.live_tokens.poll(ctx, self.ui.theme) {
-            self.checker = None;
-            // The poll re-applied tokens without the accent tint; reapply it this frame.
-            self.prefs_rt.accent = None;
+        {
+            // The Accent colors preference is the master switch for desktop theming: off means
+            // the stock themes only, no theme file and no accent.
+            self.live_tokens.disabled = !self.session.prefs().interface.accent_colors;
+            if self.live_tokens.poll(ctx, self.ui.theme) {
+                self.checker = None;
+                // The poll re-applied tokens without the accent tint; reapply it this frame.
+                self.prefs_rt.accent = None;
+            }
         }
         // Finish or expire outstanding captures first, so a new request admitted in this pass
         // sees their released budget.
