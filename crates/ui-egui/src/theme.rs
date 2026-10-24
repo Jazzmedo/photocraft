@@ -1542,8 +1542,14 @@ pub mod live {
             self.last_check = now;
             self.last_kind = Some(kind);
             let Ok(meta) = std::fs::metadata(path) else {
+                // The file is gone: fall back to the stock theme instead of keeping the last
+                // overrides until restart.
+                let had_overrides = self.stamp.take().is_some();
+                if had_overrides {
+                    super::apply(ctx, kind);
+                }
                 ctx.request_repaint_after(ABSENT_POLL);
-                return false;
+                return had_overrides;
             };
             let stamp = meta.modified().ok();
             if stamp == self.stamp && !kind_changed {
@@ -1740,6 +1746,23 @@ pub mod live {
             let ctx = egui::Context::default();
             assert!(!live.poll_at(&ctx, super::super::ThemeKind::Pro, 0.0));
             assert!(!live.poll_at(&ctx, super::super::ThemeKind::Pro, 10.0));
+        }
+
+        #[test]
+        fn removing_the_file_falls_back_to_the_stock_theme() {
+            let dir = temp_dir("fallback");
+            let path = dir.join("theme.json");
+            write(&path, r##"{"accent": "#ff0000"}"##);
+            let ctx = egui::Context::default();
+            let mut live = LiveTokens { path: Some(path.clone()), ..Default::default() };
+            assert!(live.poll_at(&ctx, super::super::ThemeKind::Pro, 0.0));
+            assert_eq!(Tokens::get(&ctx).accent, Color32::from_rgb(255, 0, 0));
+            std::fs::remove_file(&path).unwrap();
+            assert!(live.poll_at(&ctx, super::super::ThemeKind::Pro, 1.0));
+            assert_eq!(Tokens::get(&ctx).accent, Tokens::for_kind(super::super::ThemeKind::Pro).accent);
+            // Staying gone stays quiet.
+            assert!(!live.poll_at(&ctx, super::super::ThemeKind::Pro, 2.0));
+            std::fs::remove_dir_all(dir).ok();
         }
 
         #[test]
