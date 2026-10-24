@@ -1019,9 +1019,28 @@ pub fn apply(ctx: &egui::Context, kind: ThemeKind) {
     apply_tokens(ctx, Tokens::for_kind(kind));
 }
 
+/// Retint the accent family of a stock palette with a desktop accent colour, so the
+/// selected theme keeps its tuned surfaces in both modes while following the desktop's
+/// accent. Text on accent fills picks black or white by contrast.
+pub fn tint_accent(t: &mut Tokens, accent: Color32) {
+    let mix = |a: Color32, b: Color32, tt: f32| {
+        let f = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * tt).round() as u8;
+        Color32::from_rgb(f(a.r(), b.r()), f(a.g(), b.g()), f(a.b(), b.b()))
+    };
+    let luminance = |c: Color32| (0.2126 * c.r() as f32 + 0.7152 * c.g() as f32 + 0.0722 * c.b() as f32) / 255.0;
+    let on_accent = if luminance(accent) > 0.5 { Color32::BLACK } else { Color32::WHITE };
+    t.accent = accent;
+    t.accent_border = accent;
+    t.primary_bg = accent;
+    t.accent_text = on_accent;
+    t.primary_text = on_accent;
+    t.accent_soft = mix(t.card, accent, 0.30);
+    t.row_selected = mix(t.card, accent, 0.22);
+}
+
 /// Publish ready tokens and build egui's global style from them, so the visuals always match
 /// `Tokens::get` — also for the live overrides, which recolour a stock palette.
-fn apply_tokens(ctx: &egui::Context, t: Tokens) {
+pub(crate) fn apply_tokens(ctx: &egui::Context, t: Tokens) {
     // Keep native windows at SystemDefault so macOS continues reporting OS appearance changes,
     // including when an integration or restored egui state pinned its own theme preference.
     ctx.set_theme(egui::ThemePreference::System);
@@ -1270,6 +1289,42 @@ mod tests {
     }
 
     #[test]
+    fn tint_accent_recolours_only_the_accent_family() {
+        for kind in [ThemeKind::Pro, ThemeKind::StudioLight, ThemeKind::AdwaitaDark] {
+            let base = Tokens::for_kind(kind);
+            let mut t = base;
+            let accent = Color32::from_rgb(0xed, 0x5b, 0x00);
+            tint_accent(&mut t, accent);
+            assert_eq!(t.accent, accent);
+            assert_eq!(t.accent_border, accent);
+            assert_eq!(t.primary_bg, accent);
+            assert_eq!(t.accent_text, Color32::WHITE, "orange sits just under the luminance midpoint: white text ({kind:?})");
+            assert_eq!(t.primary_text, Color32::WHITE);
+            // The soft tints stay near the theme's own card colour, in both modes.
+            let near = |a: Color32, b: Color32| {
+                (a.r() as i32 - b.r() as i32).abs() < 90 && (a.g() as i32 - b.g() as i32).abs() < 90 && (a.b() as i32 - b.b() as i32).abs() < 90
+            };
+            assert!(near(t.accent_soft, t.card), "{kind:?} accent_soft {t:?} vs card {card:?}", card = base.card);
+            assert!(near(t.row_selected, t.card), "{kind:?} row_selected drifts from the card colour");
+            // Surfaces are untouched, so the stock contrast guarantees keep holding.
+            assert_eq!(t.card, base.card);
+            assert_eq!(t.text, base.text);
+            assert_eq!(t.chrome, base.chrome);
+        }
+    }
+
+    #[test]
+    fn tint_accent_picks_on_accent_text_by_luminance() {
+        for (accent, want) in [(Color32::from_rgb(0x0a, 0x0a, 0x0a), Color32::WHITE), (Color32::from_rgb(0xf0, 0xf0, 0xf0), Color32::BLACK)] {
+            let mut t = Tokens::for_kind(ThemeKind::Pro);
+            tint_accent(&mut t, accent);
+            assert_eq!(t.accent_text, want);
+            assert_eq!(t.primary_text, want);
+            assert!(contrast(t.accent_text, t.accent) >= 4.5);
+        }
+    }
+
+    #[test]
     fn theme_names_parse() {
         assert_eq!(ThemeKind::from_name("Classic"), Some(ThemeKind::Classic));
         assert_eq!(ThemeKind::from_name("studio (light)"), Some(ThemeKind::StudioLight));
@@ -1502,6 +1557,8 @@ pub mod live {
         stamp: Option<SystemTime>,
         last_check: f64,
         last_kind: Option<super::ThemeKind>,
+        /// The theme.json contents as last parsed, for the accent tint to layer over.
+        file: Option<serde_json::Value>,
     }
 
     impl LiveTokens {
@@ -1529,6 +1586,12 @@ pub mod live {
             self.poll_at(ctx, kind, ctx.input(|i| i.time))
         }
 
+        /// The theme file's overrides as last read, so the desktop accent tint
+        /// ([`super::tint_accent`]) can re-apply them under itself.
+        pub fn overrides(&self) -> Option<&serde_json::Value> {
+            self.file.as_ref()
+        }
+
         /// `poll` with an injectable clock, so tests can step past the throttle.
         fn poll_at(&mut self, ctx: &egui::Context, kind: super::ThemeKind, now: f64) -> bool {
             let Some(path) = &self.path else { return false };
@@ -1545,6 +1608,7 @@ pub mod live {
                 // The file is gone: fall back to the stock theme instead of keeping the last
                 // overrides until restart.
                 let had_overrides = self.stamp.take().is_some();
+                self.file = None;
                 if had_overrides {
                     super::apply(ctx, kind);
                 }
@@ -1564,6 +1628,7 @@ pub mod live {
             ctx.request_repaint_after(PRESENT_POLL);
             match serde_json::from_str::<serde_json::Value>(&text) {
                 Ok(v) => {
+                    self.file = Some(v.clone());
                     let mut t = Tokens::for_kind(kind);
                     let unknown = apply_overrides(&mut t, &v);
                     super::apply_tokens(ctx, t);

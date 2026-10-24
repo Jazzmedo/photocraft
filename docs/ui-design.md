@@ -27,6 +27,8 @@ The toolbar's foreground and background colour chips follow the `Tokens::round_c
 
 Release builds also follow a theme file, `theme.json` in the settings directory (the same directory as `preferences.json`): keys are `Tokens` field names, values are hex colours or radii, and the file is re-read on change, so desktop palette tools (matugen, pywal, base16) recolour the app live. Its keys override the colours of whichever theme is selected — the theme still decides the dark or light chrome. `PHOTOCRAFT_THEME_FILE` points the watcher elsewhere (see [development](development.md#live-design-tokens)).
 
+Preferences → Interface → Appearance also offers **Accent colors** (Linux only; the row is hidden where no desktop accent can be read). Off — the default — the themes are exactly as shipped. On, the accent family of whichever theme is selected is retinted with the desktop accent colour (the portal's `accent-color`, falling back to GNOME's named accent or KDE's `AccentColor`), separately derived for the dark and the light slot: surfaces and text keep the theme's tuned values, text on accent fills picks black or white by contrast, and the soft selection tints stay near the theme's own card colour. The option sits under the theme swatches and reacts live, like the appearance mode. It layers over the theme file's overrides: the accent wins on its tokens, everything else stays overridden.
+
 ## Rules
 
 - **Colours and radii come from tokens.** Read them with `Tokens::get(ctx)`; never hard-code a colour in a widget.

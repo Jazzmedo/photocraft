@@ -55,6 +55,9 @@ pub struct Runtime {
     pub(crate) selected_tool: Option<crate::state::Tool>,
     /// The tool owning the session brush and the other tools' brushes, as last remembered.
     pub(crate) tool_brushes: Option<crate::tool_memory::ToolBrushes>,
+    /// Accent tint as last applied: (enabled, packed accent colour, 0 when none, theme kind).
+    /// Cleared whenever something else applies tokens, so the tint is layered back on top.
+    pub(crate) accent: Option<(bool, u32, crate::theme::ThemeKind)>,
 }
 
 /// The GPU canvas colours from Preferences › Transparency & Gamut.
@@ -507,6 +510,36 @@ pub(crate) fn sync_appearance(app: &mut PhotocraftApp, ctx: &egui::Context) {
     }
 }
 
+/// Preferences › Interface › Accent colors (Linux): tint the selected theme's accent family with
+/// the desktop accent, over the theme file's overrides when there are any. Re-applies when the
+/// checkbox, the accent, the selected theme or the tokens underneath change; when off or without
+/// a desktop accent, the theme is applied untouched. `Services::accent_color` is `None` off
+/// Linux, which turns this into a no-op and hides the checkbox.
+fn sync_accent(app: &mut PhotocraftApp, ctx: &egui::Context) {
+    let Some(read) = app.services.accent_color.as_ref() else { return };
+    let enabled = app.session.prefs().interface.accent_colors;
+    if !enabled && app.prefs_rt.accent.is_none() {
+        return; // never touched: leave the start-up tokens alone
+    }
+    let accent = if enabled { read(ctx) } else { None };
+    let kind = app.ui.theme;
+    let packed = |c: egui::Color32| u32::from(c.r()) << 16 | u32::from(c.g()) << 8 | u32::from(c.b());
+    let state = Some((enabled, accent.map_or(0, packed), kind));
+    if app.prefs_rt.accent == state {
+        return;
+    }
+    app.prefs_rt.accent = state;
+    let mut t = crate::theme::Tokens::for_kind(kind);
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(v) = app.live_tokens.overrides() {
+        crate::theme::live::apply_overrides(&mut t, v);
+    }
+    if let Some(c) = accent {
+        crate::theme::tint_accent(&mut t, c);
+    }
+    crate::theme::apply_tokens(ctx, t);
+}
+
 /// Per-frame upkeep: theme sync, persistence, autosave and the history log.
 pub fn tick(app: &mut PhotocraftApp, ctx: &egui::Context) {
     if !app.prefs_rt.loaded {
@@ -516,6 +549,7 @@ pub fn tick(app: &mut PhotocraftApp, ctx: &egui::Context) {
     sync_rulers(app);
     sync_display_scale(app, ctx);
     sync_appearance(app, ctx);
+    sync_accent(app, ctx);
     crate::theme::set_ui_font_size(ctx, app.session.prefs().interface.ui_font_size);
     presets_store(app);
     sync_tooltips(app, ctx);
@@ -1221,7 +1255,7 @@ pub fn body(app: &mut PhotocraftApp, ui: &mut egui::Ui, f: &mut Map<String, Valu
             f.insert("__gpuInfo".into(), json!(info));
             f.insert("__gpuAdapters".into(), json!(app.perf.gpu_info.adapters));
             let system = system_theme(app, ui.ctx());
-            prefs_body(ui, f, system);
+            prefs_body(ui, f, Desktop { system, has_accent: app.services.accent_color.is_some() });
         }
         "shortcuts" => shortcuts_body(app, ui, f),
         "presets" => presets_body(app, ui, f),
@@ -1385,7 +1419,15 @@ fn preference_sections(values: &Value, search: &str) -> Vec<(&'static str, &'sta
 }
 
 /// Preferences: section list on the left, the section's settings on the right.
-fn prefs_body(ui: &mut egui::Ui, f: &mut Map<String, Value>, system: Option<egui::Theme>) {
+/// What the desktop tells the Interface page: the colour scheme for Auto mode, and whether an
+/// accent service exists (the Accent colors row shows only then; it is Linux-only).
+#[derive(Default, Clone, Copy)]
+struct Desktop {
+    system: Option<egui::Theme>,
+    has_accent: bool,
+}
+
+fn prefs_body(ui: &mut egui::Ui, f: &mut Map<String, Value>, desktop: Desktop) {
     let t = Tokens::get(ui.ctx());
     let mut section = f.get("section").and_then(Value::as_str).unwrap_or("general").to_string();
     let mut values = f.get("values").cloned().unwrap_or(Value::Null);
@@ -1457,7 +1499,7 @@ fn prefs_body(ui: &mut egui::Ui, f: &mut Map<String, Value>, system: Option<egui
                     ui.add_space(4.0);
                     ui.label(RichText::new(tl!("These settings aren't available in PhotoCraft yet.")).color(t.text_faint));
                 } else if let Some(obj) = values.get_mut(&section).and_then(Value::as_object_mut) {
-                    section_fields(ui, &section, obj, &order, lang, system, filter);
+                    section_fields(ui, &section, obj, &order, lang, desktop, filter);
                     if section == "fileHandling" {
                         ui.label(
                             RichText::new(tl!("0 turns this threshold off; SVG groups nested deeper than 100 levels are always rasterized."))
@@ -1670,22 +1712,24 @@ struct AppearanceRows {
     mode: bool,
     light: bool,
     dark: bool,
+    accent: bool,
 }
 
 impl AppearanceRows {
     /// `query` is lowercased; empty shows every row.
     fn matching(query: &str) -> Self {
         let shown = |key: &str| query.is_empty() || preference_matches("interface", key, query);
-        Self { mode: shown("appearanceMode"), light: shown("lightTheme"), dark: shown("darkTheme") }
+        Self { mode: shown("appearanceMode"), light: shown("lightTheme"), dark: shown("darkTheme"), accent: shown("accentColors") }
     }
 
     fn any(self) -> bool {
-        self.mode || self.light || self.dark
+        self.mode || self.light || self.dark || self.accent
     }
 }
 
-/// Appearance Mode and the light and dark Color Theme swatches, as rows of the Appearance grid.
-fn appearance_rows(ui: &mut egui::Ui, obj: &mut Map<String, Value>, system: Option<egui::Theme>, rows: AppearanceRows) {
+/// Appearance Mode and the light and dark Color Theme swatches, as rows of the Appearance grid,
+/// then the Accent colors checkbox when the desktop reports one.
+fn appearance_rows(ui: &mut egui::Ui, obj: &mut Map<String, Value>, desktop: Desktop, rows: AppearanceRows) {
     let t = Tokens::get(ui.ctx());
     let mut mode = obj.get("appearanceMode").and_then(Value::as_str).unwrap_or("auto").to_string();
     if rows.mode {
@@ -1695,7 +1739,7 @@ fn appearance_rows(ui: &mut egui::Ui, obj: &mut Map<String, Value>, system: Opti
         crate::widgets::dropdown(ui, "appearance-mode", tl!("Appearance Mode"), &mut mode, &pairs, 220.0);
         ui.end_row();
     }
-    let light_active = mode == "light" || (mode == "auto" && system == Some(egui::Theme::Light));
+    let light_active = mode == "light" || (mode == "auto" && desktop.system == Some(egui::Theme::Light));
     obj.insert("appearanceMode".into(), json!(mode));
     let mut light = obj.get("lightTheme").and_then(Value::as_str).unwrap_or("studioLight").to_string();
     let mut dark = obj.get("darkTheme").and_then(Value::as_str).unwrap_or("proMedium").to_string();
@@ -1709,6 +1753,13 @@ fn appearance_rows(ui: &mut egui::Ui, obj: &mut Map<String, Value>, system: Opti
     obj.insert("lightTheme".into(), json!(light));
     obj.insert("darkTheme".into(), json!(dark));
     obj.insert("favoriteThemes".into(), json!(favorites));
+    if rows.accent && desktop.has_accent {
+        ui.label("");
+        let mut on = obj.get("accentColors").and_then(Value::as_bool).unwrap_or(false);
+        crate::widgets::checkbox(ui, &mut on, tl!("Accent colors"));
+        obj.insert("accentColors".into(), json!(on));
+        ui.end_row();
+    }
 }
 
 /// A titled, outlined group of settings (Photoshop's Interface page has Appearance,
@@ -1728,7 +1779,7 @@ fn pref_group(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
 /// language, font size and scaling, then everything else. Compact enough that the language
 /// shows without scrolling in a small window (#2532). A search (`query`, lowercased) hides the
 /// rows that don't match and skips a group left empty.
-fn interface_groups(ui: &mut egui::Ui, obj: &mut Map<String, Value>, keys: &[String], lang: crate::i18n::Lang, system: Option<egui::Theme>, query: &str) {
+fn interface_groups(ui: &mut egui::Ui, obj: &mut Map<String, Value>, keys: &[String], lang: crate::i18n::Lang, desktop: Desktop, query: &str) {
     const APPEARANCE: [&str; 3] = ["canvasColor", "canvasCustomColor", "canvasBorder"];
     const PRESENTATION: [&str; 3] = ["language", "uiFontSize", "uiScale"];
     let shown = |k: &str| keys.iter().any(|key| key == k) && field_visible("interface", obj, k, query);
@@ -1744,7 +1795,7 @@ fn interface_groups(ui: &mut egui::Ui, obj: &mut Map<String, Value>, keys: &[Str
     if rows.any() || !appearance.is_empty() {
         pref_group(ui, "Appearance", |ui| {
             grid("interface-appearance").show(ui, |ui| {
-                appearance_rows(ui, obj, system, rows);
+                appearance_rows(ui, obj, desktop, rows);
                 field_rows(ui, "interface", obj, appearance, lang);
             });
         });
@@ -1776,7 +1827,7 @@ fn ctx_take_pick(ui: &egui::Ui) -> Option<(String, String)> {
 /// by their own widgets; their stored values pass through untouched.
 fn field_visible(section: &str, obj: &Map<String, Value>, k: &str, query: &str) -> bool {
     let path = format!("{section}.{k}");
-    let drawn_elsewhere = (section == "interface" && matches!(k, "theme" | "appearanceMode" | "darkTheme" | "lightTheme" | "favoriteThemes"))
+    let drawn_elsewhere = (section == "interface" && matches!(k, "theme" | "appearanceMode" | "darkTheme" | "lightTheme" | "favoriteThemes" | "accentColors"))
         // View › Rulers (⌘R) sets it, as in Photoshop.
         || path == "unitsAndRulers.showRulers"
         || (section == "performance" && matches!(k, "useGpu" | "gpuBackend" | "gpuAdapter" | "renderingMode" | "memoryUsageMb"))
@@ -1792,20 +1843,12 @@ fn field_visible(section: &str, obj: &Map<String, Value>, k: &str, query: &str) 
 
 /// Generic editor for a section's fields: checkboxes, dropdowns for choices, colour swatches,
 /// number fields with the preference's range, text fields.
-fn section_fields(
-    ui: &mut egui::Ui,
-    section: &str,
-    obj: &mut Map<String, Value>,
-    order: &[String],
-    lang: crate::i18n::Lang,
-    system: Option<egui::Theme>,
-    search: &str,
-) {
+fn section_fields(ui: &mut egui::Ui, section: &str, obj: &mut Map<String, Value>, order: &[String], lang: crate::i18n::Lang, desktop: Desktop, search: &str) {
     let query = search.to_lowercase();
     let mut keys: Vec<String> = order.iter().filter(|k| obj.contains_key(*k)).cloned().collect();
     keys.extend(obj.keys().filter(|k| !order.contains(k)).cloned());
     if section == "interface" {
-        interface_groups(ui, obj, &keys, lang, system, &query);
+        interface_groups(ui, obj, &keys, lang, desktop, &query);
         return;
     }
     if section == "performance" && (query.is_empty() || preference_matches(section, "renderingMode", &query)) {
@@ -2752,9 +2795,10 @@ mod tests {
         use egui_kittest::{Harness, kittest::Queryable};
         let values = json!({"memoryUsageMb":50000}).as_object().unwrap().clone();
         assert!(!field_visible("performance", &values, "memoryUsageMb", ""));
-        let mut h = Harness::builder()
-            .with_size(vec2(680.0, 350.0))
-            .build_ui_state(|ui, values| section_fields(ui, "performance", values, &["memoryUsageMb".into()], crate::i18n::Lang::EN, None, ""), values);
+        let mut h = Harness::builder().with_size(vec2(680.0, 350.0)).build_ui_state(
+            |ui, values| section_fields(ui, "performance", values, &["memoryUsageMb".into()], crate::i18n::Lang::EN, Desktop::default(), ""),
+            values,
+        );
         h.run_steps(2);
         h.get_by_label("Memory Usage");
         h.get_by_label("Per-document RAM limit (MB)");
@@ -4387,7 +4431,7 @@ mod tests {
         use egui_kittest::{Harness, kittest::Queryable};
         let obj = json!({"renderingMode": "auto", "historyStates": 50}).as_object().unwrap().clone();
         let mut h = Harness::new_ui_state(
-            |ui, obj: &mut Map<String, Value>| section_fields(ui, "performance", obj, &[], crate::i18n::Lang::from_pref("en"), None, ""),
+            |ui, obj: &mut Map<String, Value>| section_fields(ui, "performance", obj, &[], crate::i18n::Lang::from_pref("en"), Desktop::default(), ""),
             obj,
         );
         h.run_steps(4);
@@ -4396,7 +4440,7 @@ mod tests {
         // A search that leaves Rendering Mode out leaves its notice out too.
         let obj = json!({"renderingMode": "auto", "historyStates": 50}).as_object().unwrap().clone();
         let mut h = Harness::new_ui_state(
-            |ui, obj: &mut Map<String, Value>| section_fields(ui, "performance", obj, &[], crate::i18n::Lang::from_pref("en"), None, "history"),
+            |ui, obj: &mut Map<String, Value>| section_fields(ui, "performance", obj, &[], crate::i18n::Lang::from_pref("en"), Desktop::default(), "history"),
             obj,
         );
         h.run_steps(4);
@@ -4422,7 +4466,7 @@ mod tests {
         use egui_kittest::{Harness, kittest::Queryable};
         let obj = json!({"showTooltips": true}).as_object().unwrap().clone();
         let mut h = Harness::new_ui_state(
-            |ui, obj: &mut Map<String, Value>| section_fields(ui, "interface", obj, &[], crate::i18n::Lang::from_pref("en"), None, ""),
+            |ui, obj: &mut Map<String, Value>| section_fields(ui, "interface", obj, &[], crate::i18n::Lang::from_pref("en"), Desktop::default(), ""),
             obj,
         );
         h.run_steps(4);

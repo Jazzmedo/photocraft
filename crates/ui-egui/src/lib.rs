@@ -519,6 +519,9 @@ pub type LoadTextFn = Box<dyn FnMut() -> Option<String>>;
 pub type SaveTextFn = Box<dyn FnMut(&str) -> Result<(), String>>;
 /// Platform appearance when egui cannot detect it (for example, Wayland without a theme event).
 pub type SystemThemeFn = Box<dyn Fn(&egui::Context) -> Option<egui::Theme>>;
+/// The desktop's accent colour (Linux: the portal's `accent-color`, GNOME or KDE), read per frame
+/// with the context to wake on change; `None` where the platform has none or reports none.
+pub type AccentFn = Box<dyn Fn(&egui::Context) -> Option<egui::Color32>>;
 /// Autosave a document snapshot for crash recovery: (snapshot, revision, original path).
 pub type AutosaveFn = Box<dyn FnMut(&std::sync::Arc<Document>, u64, Option<&str>) -> Result<(), String>>;
 /// Poll successful or failed background writes: (document id, revision, result).
@@ -634,6 +637,9 @@ pub struct Services {
     /// Photoshop's live keyboard shortcut set, imported once at first launch (`kys_import`).
     pub photoshop_shortcuts: Option<PhotoshopShortcutsFn>,
     pub system_theme: Option<SystemThemeFn>,
+    /// The desktop accent colour behind Preferences › Interface › Accent colors (Linux only;
+    /// `None` elsewhere, which hides the option).
+    pub accent_color: Option<AccentFn>,
     /// The native window is connected directly to a Wayland compositor.
     pub is_wayland: bool,
     /// On Wayland, the shell command that starts this install under XWayland, where native file
@@ -2387,6 +2393,8 @@ impl PhotocraftApp {
         #[cfg(not(target_arch = "wasm32"))]
         if self.live_tokens.poll(ctx, self.ui.theme) {
             self.checker = None;
+            // The poll re-applied tokens without the accent tint; reapply it this frame.
+            self.prefs_rt.accent = None;
         }
         // Finish or expire outstanding captures first, so a new request admitted in this pass
         // sees their released budget.
