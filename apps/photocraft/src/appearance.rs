@@ -294,8 +294,9 @@ fn wal_accent(var: &dyn Fn(&str) -> Option<String>) -> Option<egui::Color32> {
 }
 
 /// Reads the desktop accent once, then follows the portal's `accent-color` changes the same way
-/// [`service`] follows the colour scheme. There is no polling: the worker sleeps in the signal
-/// iterator and wakes the UI only when the value changes.
+/// [`service`] follows the colour scheme. While the portal answers, its accent is authoritative;
+/// while it does not, the fallback settings files are polled, so an accent picked in the
+/// desktop's settings later still reaches the app.
 pub fn accent_service() -> Option<photocraft_ui_egui::AccentFn> {
     #[cfg(target_os = "linux")]
     {
@@ -313,10 +314,12 @@ pub fn accent_service() -> Option<photocraft_ui_egui::AccentFn> {
             }
             publisher.publish(initial);
             // The portal signals accent changes on GNOME 47+ and Plasma; where it has no answer
-            // (older portals, or accents read from files), the fallback files are polled instead,
-            // so an accent picked in the desktop's settings later still reaches the app.
+            // (older portals, or accents read from files), the fallback files are polled instead.
+            let portal_authoritative = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(via_portal.is_some()));
+            let mut files_watched = false;
             if via_portal.is_none() {
-                publisher.clone().watch_files();
+                publisher.clone().watch_files(std::sync::Arc::clone(&portal_authoritative));
+                files_watched = true;
             }
             let Some(signals) = signals else { return };
             for message in signals {
@@ -326,7 +329,14 @@ pub fn accent_service() -> Option<photocraft_ui_egui::AccentFn> {
                 if namespace != PORTAL_NAMESPACE || key != ACCENT_PORTAL_KEY {
                     continue;
                 }
-                publisher.publish(decode_accent_value(changed).or_else(fallback_accent));
+                let decoded = decode_accent_value(changed);
+                let (portal_now, watch_now) = after_signal(decoded.is_some(), files_watched);
+                if watch_now && !files_watched {
+                    publisher.clone().watch_files(std::sync::Arc::clone(&portal_authoritative));
+                }
+                files_watched = watch_now;
+                portal_authoritative.store(portal_now, std::sync::atomic::Ordering::Relaxed);
+                publisher.publish(decoded.or_else(fallback_accent));
             }
         })
     }
@@ -334,6 +344,14 @@ pub fn accent_service() -> Option<photocraft_ui_egui::AccentFn> {
     {
         None
     }
+}
+
+/// What a portal accent signal leaves behind: whether the portal still owns the accent, and
+/// whether the fallback file poller must be running. A portal that stops answering hands the
+/// accent to the fallback files from then on; one that answers again takes it back.
+#[cfg(target_os = "linux")]
+fn after_signal(portal_answered: bool, files_watched: bool) -> (bool, bool) {
+    (portal_answered, files_watched || !portal_answered)
 }
 
 /// The accent from the desktop's settings files, when the portal has none: GNOME's named accent,
@@ -367,12 +385,15 @@ impl AccentPublisher {
     }
 
     /// Follow the settings files the portal does not signal (`kdeglobals`, pywal), polling every
-    /// couple of seconds; `publish` only wakes the UI on a real change.
-    fn watch_files(self) {
+    /// couple of seconds; `publish` only wakes the UI on a real change. While
+    /// `portal_authoritative` is set, the poller stays quiet so the portal's accent wins.
+    fn watch_files(self, portal_authoritative: std::sync::Arc<std::sync::atomic::AtomicBool>) {
         let _ = std::thread::Builder::new().name("accent-files".into()).spawn(move || {
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(2));
-                self.publish(fallback_accent());
+                if !portal_authoritative.load(std::sync::atomic::Ordering::Relaxed) {
+                    self.publish(fallback_accent());
+                }
             }
         });
     }
@@ -405,6 +426,19 @@ fn unpack_accent(packed: u32) -> Option<egui::Color32> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_portal_that_stops_answering_hands_the_accent_to_the_fallback_files() {
+        use super::after_signal;
+        // A portal that keeps answering stays authoritative and never needs the file poller.
+        assert_eq!(after_signal(true, false), (true, false));
+        assert_eq!(after_signal(true, true), (true, true));
+        // A signal without a portal accent hands the accent to the fallback files — once,
+        // even if the initial portal read had an accent and never started the poller.
+        assert_eq!(after_signal(false, false), (false, true));
+        assert_eq!(after_signal(false, true), (false, true));
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn startup_keeps_changes_emitted_during_initial_read() {
