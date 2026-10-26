@@ -1021,18 +1021,23 @@ pub fn apply(ctx: &egui::Context, kind: ThemeKind) {
 
 /// Retint the accent family of a stock palette with a desktop accent colour, so the
 /// selected theme keeps its tuned surfaces in both modes while following the desktop's
-/// accent. Text on accent fills picks black or white by contrast.
+/// accent. Text on accent fills picks black or white by WCAG contrast; `accent_text` keeps
+/// the theme's own colour, as it is drawn on the theme's surfaces, not on accent fills.
 pub fn tint_accent(t: &mut Tokens, accent: Color32) {
     let mix = |a: Color32, b: Color32, tt: f32| {
         let f = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * tt).round() as u8;
         Color32::from_rgb(f(a.r(), b.r()), f(a.g(), b.g()), f(a.b(), b.b()))
     };
-    let luminance = |c: Color32| (0.2126 * c.r() as f32 + 0.7152 * c.g() as f32 + 0.0722 * c.b() as f32) / 255.0;
-    let on_accent = if luminance(accent) > 0.5 { Color32::BLACK } else { Color32::WHITE };
+    let linear = |v: u8| {
+        let c = f32::from(v) / 255.0;
+        if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+    };
+    let l = 0.2126 * linear(accent.r()) + 0.7152 * linear(accent.g()) + 0.0722 * linear(accent.b());
+    // Whichever of black or white contrasts more with the accent, always at least 4.5:1.
+    let on_accent = if (l + 0.05) / 0.05 >= 1.05 / (l + 0.05) { Color32::BLACK } else { Color32::WHITE };
     t.accent = accent;
     t.accent_border = accent;
     t.primary_bg = accent;
-    t.accent_text = on_accent;
     t.primary_text = on_accent;
     t.accent_soft = mix(t.card, accent, 0.30);
     t.row_selected = mix(t.card, accent, 0.22);
@@ -1298,8 +1303,8 @@ mod tests {
             assert_eq!(t.accent, accent);
             assert_eq!(t.accent_border, accent);
             assert_eq!(t.primary_bg, accent);
-            assert_eq!(t.accent_text, Color32::WHITE, "orange sits just under the luminance midpoint: white text ({kind:?})");
-            assert_eq!(t.primary_text, Color32::WHITE);
+            assert_eq!(t.primary_text, Color32::BLACK, "orange takes black text: 6.1:1 against 3.4:1 for white ({kind:?})");
+            assert_eq!(t.accent_text, base.accent_text, "accent labels keep the theme's own colour ({kind:?})");
             // The soft tints stay near the theme's own card colour, in both modes.
             let near = |a: Color32, b: Color32| {
                 (a.r() as i32 - b.r() as i32).abs() < 90 && (a.g() as i32 - b.g() as i32).abs() < 90 && (a.b() as i32 - b.b() as i32).abs() < 90
@@ -1314,13 +1319,20 @@ mod tests {
     }
 
     #[test]
-    fn tint_accent_picks_on_accent_text_by_luminance() {
-        for (accent, want) in [(Color32::from_rgb(0x0a, 0x0a, 0x0a), Color32::WHITE), (Color32::from_rgb(0xf0, 0xf0, 0xf0), Color32::BLACK)] {
+    fn tint_accent_picks_on_accent_text_by_contrast() {
+        // Mid-tone desktop accents (GNOME's blue and green, and the orange) all take black:
+        // white on them sits under 4.5:1, the luminance midpoint used to miss that.
+        for (accent, want) in [
+            (Color32::from_rgb(0x0a, 0x0a, 0x0a), Color32::WHITE),
+            (Color32::from_rgb(0xf0, 0xf0, 0xf0), Color32::BLACK),
+            (Color32::from_rgb(0x35, 0x84, 0xe4), Color32::BLACK),
+            (Color32::from_rgb(0x3a, 0x94, 0x4a), Color32::BLACK),
+            (Color32::from_rgb(0xed, 0x5b, 0x00), Color32::BLACK),
+        ] {
             let mut t = Tokens::for_kind(ThemeKind::Pro);
             tint_accent(&mut t, accent);
-            assert_eq!(t.accent_text, want);
             assert_eq!(t.primary_text, want);
-            assert!(contrast(t.accent_text, t.accent) >= 4.5);
+            assert!(contrast(t.primary_text, t.primary_bg) >= 4.5, "{accent:?}: {}", contrast(t.primary_text, t.primary_bg));
         }
     }
 
@@ -1634,11 +1646,15 @@ pub mod live {
                 ctx.request_repaint_after(PRESENT_POLL);
                 return false;
             }
-            self.stamp = stamp;
             let Ok(text) = std::fs::read_to_string(path) else {
+                // The stamp is not stored: a failed read retries on the next poll (ABSENT_POLL),
+                // as a palette tool rewriting the file in place can fail one read transiently.
                 ctx.request_repaint_after(ABSENT_POLL);
                 return false;
             };
+            // Stored only once read: a malformed file keeps its stamp, so it is not re-read
+            // and re-warned on every poll.
+            self.stamp = stamp;
             ctx.request_repaint_after(PRESENT_POLL);
             match serde_json::from_str::<serde_json::Value>(&text) {
                 Ok(v) => {
@@ -1839,6 +1855,23 @@ pub mod live {
             rewrite(&path, "not json at all", std::time::Duration::from_secs(5));
             assert!(!live.poll_at(&ctx, super::super::ThemeKind::Pro, 1.0));
             assert_eq!(Tokens::get(&ctx).accent, Color32::from_rgb(255, 0, 0));
+            std::fs::remove_dir_all(dir).ok();
+        }
+
+        #[test]
+        fn a_failed_read_is_retried_on_the_next_poll() {
+            let dir = temp_dir("failed-read");
+            let path = dir.join("theme.json");
+            // A directory at the watched path: the mtime poll sees a stamp, but reading fails.
+            std::fs::create_dir_all(&path).unwrap();
+            let ctx = egui::Context::default();
+            let mut live = LiveTokens { path: Some(path.clone()), ..Default::default() };
+            assert!(!live.poll_at(&ctx, super::super::ThemeKind::Pro, 0.0));
+            assert!(live.stamp.is_none(), "a failed read must not store its stamp, or the 2 s retry never re-reads");
+            std::fs::remove_dir_all(&path).unwrap();
+            write(&path, r##"{"accent": "#00ff00"}"##);
+            assert!(live.poll_at(&ctx, super::super::ThemeKind::Pro, 2.0), "the retry after the failure applies the file");
+            assert_eq!(Tokens::get(&ctx).accent, Color32::from_rgb(0, 255, 0));
             std::fs::remove_dir_all(dir).ok();
         }
 
