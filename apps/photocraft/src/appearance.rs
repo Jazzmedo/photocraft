@@ -241,11 +241,22 @@ fn decode_accent_value(value: zbus::zvariant::OwnedValue) -> Option<egui::Color3
     None
 }
 
-/// GNOME fallback: the named accent from `gsettings`, read only on the accent worker.
+/// GNOME fallback: the named accent from `gsettings`, read only on the accent worker — and only
+/// in a GNOME session, where an unset accent legitimately means the default blue. `gsettings`
+/// ships with GLib everywhere (Kubuntu included), and outside GNOME it answers with that same
+/// empty string, which would hide the desktop's real accent behind GNOME's blue.
 #[cfg(target_os = "linux")]
 fn gnome_accent() -> Option<egui::Color32> {
-    let text = gsettings_get("org.gnome.desktop.interface", "accent-color")?;
-    gnome_named_accent(&text)
+    if !gnome_session(&|k| std::env::var(k).ok()) {
+        return None;
+    }
+    gnome_named_accent(&gsettings_get("org.gnome.desktop.interface", "accent-color")?)
+}
+
+/// Whether the session reports itself as GNOME.
+#[cfg(target_os = "linux")]
+fn gnome_session(var: &dyn Fn(&str) -> Option<String>) -> bool {
+    var("XDG_CURRENT_DESKTOP").is_some_and(|d| d.to_uppercase().contains("GNOME"))
 }
 
 #[cfg(target_os = "linux")]
@@ -456,6 +467,19 @@ mod tests {
         assert_eq!(super::gnome_named_accent(""), Some(blue), "the default appearance is blue");
         assert_eq!(super::gnome_named_accent("'orange'"), Some(egui::Color32::from_rgb(0xed, 0x5b, 0x00)));
         assert_eq!(super::gnome_named_accent("magenta"), None);
+    }
+
+    /// The GNOME gsettings fallback applies only in a GNOME session: elsewhere gsettings (which
+    /// ships with GLib everywhere) answers with the same empty "default" string and would hide
+    /// the desktop's real accent behind GNOME's blue.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_gnome_fallback_only_applies_in_a_gnome_session() {
+        let env = &[("XDG_CURRENT_DESKTOP", "ubuntu:GNOME")];
+        assert!(super::gnome_session(&|k| env.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())));
+        let kde = &[("XDG_CURRENT_DESKTOP", "KDE")];
+        assert!(!super::gnome_session(&|k| kde.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())));
+        assert!(!super::gnome_session(&|_| None), "unset: not a GNOME session");
     }
 
     /// The KDE fallback reads `AccentColor` (byte triple or hex) with the scheme's selection
