@@ -521,7 +521,14 @@ fn sync_accent(app: &mut PhotocraftApp, ctx: &egui::Context) {
     if !enabled && app.prefs_rt.accent.is_none() {
         return; // never touched: leave the start-up tokens alone
     }
-    let accent = if enabled { read(ctx) } else { None };
+    let mut accent = if enabled { read(ctx) } else { None };
+    #[cfg(not(target_arch = "wasm32"))]
+    if accent.is_some() && app.live_tokens.overrides().and_then(|v| v.get("accent")).is_some() {
+        // A theme file that carries its own accent IS the shell's palette (DMS, Caelestia,
+        // Noctalia): it wins, and the generic desktop fallbacks — which can disagree with it on
+        // a machine whose leftover GNOME or KDE settings name another colour — only fill the gap.
+        accent = None;
+    }
     let kind = app.ui.theme;
     let packed = |c: egui::Color32| u32::from(c.r()) << 16 | u32::from(c.g()) << 8 | u32::from(c.b());
     let state = Some((enabled, accent.map_or(0, packed), kind));
@@ -1256,13 +1263,6 @@ pub fn body(app: &mut PhotocraftApp, ui: &mut egui::Ui, f: &mut Map<String, Valu
             f.insert("__gpuAdapters".into(), json!(app.perf.gpu_info.adapters));
             let system = system_theme(app, ui.ctx());
             prefs_body(ui, f, Desktop { system, has_accent: app.services.accent_color.is_some() });
-            // The Accent colors checkbox takes effect when clicked, not on Apply (the draft
-            // carries the same value, so committing later does not undo it).
-            if let Some(on) = ui.ctx().data_mut(|d| d.remove_temp::<bool>(egui::Id::new(ACCENT_TOGGLE)))
-                && let Err(e) = app.run("prefs.set", json!({"path": "interface.accentColors", "value": on}))
-            {
-                app.ui.status = e;
-            }
         }
         "shortcuts" => shortcuts_body(app, ui, f),
         "presets" => presets_body(app, ui, f),
@@ -1763,11 +1763,8 @@ fn appearance_rows(ui: &mut egui::Ui, obj: &mut Map<String, Value>, desktop: Des
     if rows.accent && desktop.has_accent {
         ui.label("");
         let mut on = obj.get("accentColors").and_then(Value::as_bool).unwrap_or(false);
-        // Applied at once (see ACCENT_TOGGLE), and the draft carries the same value so a later
-        // Apply or OK does not undo it.
-        if crate::widgets::checkbox(ui, &mut on, tl!("Accent colors")).changed() {
-            ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(ACCENT_TOGGLE), on));
-        }
+        // Staged like the other rows: the change lands with Apply or OK.
+        crate::widgets::checkbox(ui, &mut on, tl!("Accent colors"));
         obj.insert("accentColors".into(), json!(on));
         ui.end_row();
     }
@@ -1827,10 +1824,6 @@ fn interface_groups(ui: &mut egui::Ui, obj: &mut Map<String, Value>, keys: &[Str
 /// Where a clicked colour swatch leaves its preference path and label for the dialog body, which
 /// holds the fields the Color Picker request goes in.
 const PICK_ID: &str = "prefs-pick-color";
-
-/// Where a clicked Accent colors checkbox leaves its new value for `body`, which applies it at
-/// once (like the theme swatches) instead of waiting for Apply.
-const ACCENT_TOGGLE: &str = "prefs-accent-toggle";
 
 /// The colour swatch clicked this frame, if any: (preference path, label).
 fn ctx_take_pick(ui: &egui::Ui) -> Option<(String, String)> {
@@ -3017,6 +3010,26 @@ mod tests {
         assert_eq!(shown.primary_text, stock.primary_text);
         assert_eq!(shown.accent_soft, stock.accent_soft);
         assert_eq!(shown.row_selected, stock.row_selected);
+    }
+
+    /// A theme file that carries its own accent IS the shell's palette (DMS, Caelestia,
+    /// Noctalia): the generic desktop fallbacks — which can disagree on a machine with a
+    /// leftover GNOME or KDE setting naming another colour — must not override it.
+    #[test]
+    fn the_theme_files_own_accent_wins_over_the_desktop_fallback() {
+        let ctx = egui::Context::default();
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+        let dir = std::env::temp_dir().join(format!("photocraft-file-accent-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("theme.json"), r##"{"accent": "#a8b665"}"##).unwrap();
+        app.follow_theme_file(dir.join("theme.json"));
+        let amber = egui::Color32::from_rgb(0xc8, 0x88, 0x00);
+        app.services.accent_color = Some(Box::new(move |_| Some(amber)));
+        app.run("prefs.set", json!({"path": "interface.accentColors", "value": true})).unwrap();
+        app.live_tokens.poll(&ctx, app.ui.theme);
+        tick(&mut app, &ctx);
+        assert_eq!(crate::theme::Tokens::get(&ctx).accent, egui::Color32::from_rgb(0xa8, 0xb6, 0x65), "the shell's own accent shows, not the desktop fallback");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
