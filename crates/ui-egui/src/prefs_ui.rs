@@ -4512,7 +4512,7 @@ mod tests {
         use egui_kittest::{Harness, kittest::Queryable};
         let obj = json!({"allowAgentControl": true, "controlPort": 0}).as_object().unwrap().clone();
         let mut h = Harness::new_ui_state(
-            |ui, obj: &mut Map<String, Value>| section_fields(ui, "integrations", obj, &[], crate::i18n::Lang::from_pref("en"), None, ""),
+            |ui, obj: &mut Map<String, Value>| section_fields(ui, "integrations", obj, &[], crate::i18n::Lang::from_pref("en"), Desktop::default(), ""),
             obj,
         );
         h.run_steps(4);
