@@ -531,7 +531,9 @@ fn sync_accent(app: &mut PhotocraftApp, ctx: &egui::Context) {
     }
     let kind = app.ui.theme;
     let packed = |c: egui::Color32| u32::from(c.r()) << 16 | u32::from(c.g()) << 8 | u32::from(c.b());
-    let state = Some((enabled, accent.map_or(0, packed), kind));
+    // The presence bit keeps a pure black accent (packed 0) distinct from no accent in the
+    // cache key, the same packing the desktop's accent service publishes with.
+    let state = Some((enabled, accent.map_or(0, |c| 0x0100_0000 | packed(c)), kind));
     if app.prefs_rt.accent == state {
         return;
     }
@@ -3010,6 +3012,28 @@ mod tests {
         assert_eq!(shown.primary_text, stock.primary_text);
         assert_eq!(shown.accent_soft, stock.accent_soft);
         assert_eq!(shown.row_selected, stock.row_selected);
+    }
+
+    /// A pure black desktop accent packs to the same key as no accent without the presence
+    /// bit, so switching between the two left the previous tokens applied.
+    #[test]
+    fn a_black_accent_is_distinct_from_no_accent() {
+        let ctx = egui::Context::default();
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+        let current = std::rc::Rc::new(std::cell::Cell::new(Some(egui::Color32::BLACK)));
+        let reader = std::rc::Rc::clone(&current);
+        app.services.accent_color = Some(Box::new(move |_| reader.get()));
+        app.run("prefs.set", json!({"path": "interface.accentColors", "value": true})).unwrap();
+        tick(&mut app, &ctx);
+        assert_eq!(crate::theme::Tokens::get(&ctx).accent, egui::Color32::BLACK, "a pure black accent applies");
+
+        current.set(None);
+        tick(&mut app, &ctx);
+        assert_eq!(crate::theme::Tokens::get(&ctx).accent, crate::theme::Tokens::for_kind(app.ui.theme).accent, "no accent restores the stock theme");
+
+        current.set(Some(egui::Color32::BLACK));
+        tick(&mut app, &ctx);
+        assert_eq!(crate::theme::Tokens::get(&ctx).accent, egui::Color32::BLACK, "black applies again after none");
     }
 
     /// A theme file that carries its own accent IS the shell's palette (DMS, Caelestia,
