@@ -1633,7 +1633,7 @@ pub mod live {
             let Ok(meta) = std::fs::metadata(path) else {
                 // The file is gone: fall back to the stock theme instead of keeping the last
                 // overrides until restart.
-                let had_overrides = self.stamp.take().is_some();
+                let had_overrides = self.stamp.take().is_some() || self.file.is_some();
                 self.file = None;
                 if had_overrides {
                     super::apply(ctx, kind);
@@ -1647,8 +1647,10 @@ pub mod live {
                 return false;
             }
             let Ok(text) = std::fs::read_to_string(path) else {
-                // The stamp is not stored: a failed read retries on the next poll (ABSENT_POLL),
-                // as a palette tool rewriting the file in place can fail one read transiently.
+                // The stamp is dropped rather than kept or stored, so the next poll retries:
+                // a palette tool rewriting the file in place can fail one read transiently,
+                // and a base-theme switch can force that read at an unchanged mtime.
+                self.stamp = None;
                 ctx.request_repaint_after(ABSENT_POLL);
                 return false;
             };
@@ -1872,6 +1874,42 @@ pub mod live {
             write(&path, r##"{"accent": "#00ff00"}"##);
             assert!(live.poll_at(&ctx, super::super::ThemeKind::Pro, 2.0), "the retry after the failure applies the file");
             assert_eq!(Tokens::get(&ctx).accent, Color32::from_rgb(0, 255, 0));
+            std::fs::remove_dir_all(dir).ok();
+        }
+
+        #[test]
+        fn a_failed_re_read_after_a_theme_switch_is_retried_at_an_unchanged_mtime() {
+            let dir = temp_dir("failed-reread");
+            let path = dir.join("theme.json");
+            write(&path, r##"{"accent": "#ff0000"}"##);
+            let ctx = egui::Context::default();
+            let mut live = LiveTokens { path: Some(path.clone()), ..Default::default() };
+            assert!(live.poll_at(&ctx, super::super::ThemeKind::Pro, 0.0));
+            // Make reading fail without changing the mtime the poll compares: invalid UTF-8
+            // fails read_to_string while metadata keeps reporting the same stamp. A helper,
+            // because the sequence needs it twice at the same stamp.
+            use std::io::Write as _;
+            let stamp = std::fs::metadata(&path).unwrap().modified().unwrap();
+            let write_at_stamp = |bytes: &[u8]| {
+                let mut f = std::fs::File::options().write(true).open(&path).unwrap();
+                f.write_all(bytes).unwrap();
+                f.set_times(std::fs::FileTimes::new().set_modified(stamp)).unwrap();
+            };
+            // A base-theme switch re-reads even at an unchanged stamp, and that read fails.
+            write_at_stamp(&[0xff, 0xfe, 0x00, 0x01]);
+            assert!(!live.poll_at(&ctx, super::super::ThemeKind::SoftDark, 1.0));
+            assert!(live.stamp.is_none(), "the failed re-read drops the old stamp, or the next poll skips the read");
+            // Same mtime again, valid content: the retry must apply it despite the equal stamp.
+            write_at_stamp(br##"{"accent": "#0000ff"}"##);
+            assert!(live.poll_at(&ctx, super::super::ThemeKind::SoftDark, 2.0), "the retry applies the file at an unchanged mtime");
+            assert_eq!(Tokens::get(&ctx).accent, Color32::from_rgb(0, 0, 255));
+            // Another forced read that fails, then the file disappears: the last overrides
+            // still drop to the stock theme, with no stamp left to say so — only the file.
+            write_at_stamp(&[0xff, 0xfe, 0x00, 0x01]);
+            assert!(!live.poll_at(&ctx, super::super::ThemeKind::Adwaita, 2.5));
+            std::fs::remove_file(&path).unwrap();
+            assert!(live.poll_at(&ctx, super::super::ThemeKind::Adwaita, 3.0), "the overrides from the last good read are dropped");
+            assert_eq!(Tokens::get(&ctx).accent, Tokens::for_kind(super::super::ThemeKind::Adwaita).accent);
             std::fs::remove_dir_all(dir).ok();
         }
 
